@@ -183,10 +183,12 @@ export class OpenSheetMusicDisplay {
         }
     }
 
+    private renderStart: number = 0;
     /**
      * Render the music sheet in the container
      */
     public render(): void {
+        this.renderStart = Date.now();
         if (!this.graphic) {
             throw new Error("OpenSheetMusicDisplay: Before rendering a music sheet, please load a MusicXML file");
         }
@@ -246,6 +248,7 @@ export class OpenSheetMusicDisplay {
         }
         this.zoomUpdated = false;
         //console.log("[OSMD] render finished");
+        console.log("render time: ", Date.now() - this.renderStart);
     }
 
     private createOrRefreshRenderBackend(): void {

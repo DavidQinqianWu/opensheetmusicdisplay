@@ -1,11 +1,11 @@
 import { EngravingRules } from "./EngravingRules";
 import { StaffLine } from "./StaffLine";
 import { PointF2D } from "../../Common/DataObjects/PointF2D";
-import { CanvasVexFlowBackend } from "./VexFlow/CanvasVexFlowBackend";
 import { VexFlowMeasure } from "./VexFlow/VexFlowMeasure";
-import { unitInPixels } from "./VexFlow/VexFlowMusicSheetDrawer";
-import log from "loglevel";
 import { BoundingBox } from "./BoundingBox";
+import { GraphicalStaffEntry } from "./GraphicalStaffEntry";
+import { VexFlowGraphicalNote } from "./VexFlow";
+import { Note } from "../VoiceData/Note";
 /**
  * This class calculates and holds the skyline and bottom line information.
  * It also has functions to update areas of the two lines if new elements are
@@ -34,188 +34,136 @@ export class SkyBottomLineCalculator {
      * This method calculates the Sky- and BottomLines for a StaffLine.
      */
     public calculateLines(): void {
-        // calculate arrayLength
-        const arrayLength: number = Math.max(Math.ceil(this.StaffLineParent.PositionAndShape.Size.width * this.SamplingUnit), 1);
         this.mSkyLine = [];
         this.mBottomLine = [];
 
-        // Create a temporary canvas outside the DOM to draw the measure in.
-        const tmpCanvas: any = new CanvasVexFlowBackend(this.StaffLineParent.ParentMusicSystem.rules);
         // search through all Measures
         for (const measure of this.StaffLineParent.Measures as VexFlowMeasure[]) {
             // must calculate first AbsolutePositions
             measure.PositionAndShape.calculateAbsolutePositionsRecursive(0, 0);
-
-            // Pre initialize and get stuff for more performance
-            const vsStaff: any = measure.getVFStave();
-            let width: number = vsStaff.getWidth();
-            if (!(width > 0)) {
-                log.warn("SkyBottomLineCalculator: width not > 0 in measure " + measure.MeasureNumber);
-                width = 50;
-            }
-            // Headless because we are outside the DOM
-            tmpCanvas.initializeHeadless(width);
-            const ctx: any = tmpCanvas.getContext();
-            const canvas: any = tmpCanvas.getCanvas();
-            width = canvas.width;
-            const height: number = canvas.height;
-
-            // This magic number is an offset from the top image border so that
-            // elements above the staffline can be drawn correctly.
-            vsStaff.setY(vsStaff.y + 100);
-            const oldMeasureWidth: number = vsStaff.getWidth();
-            // We need to tell the VexFlow stave about the canvas width. This looks
-            // redundant because it should know the canvas but somehow it doesn't.
-            // Maybe I am overlooking something but for now this does the trick
-            vsStaff.setWidth(width);
-            measure.format();
-            vsStaff.setWidth(oldMeasureWidth);
-            try {
-                measure.draw(ctx);
-                // Vexflow errors can happen here, then our complete rendering loop would halt without catching errors.
-            } catch (ex) {
-                log.warn("SkyBottomLineCalculator.calculateLines.draw", ex);
-            }
-
-            // imageData.data is a Uint8ClampedArray representing a one-dimensional array containing the data in the RGBA order
-            // RGBA is 32 bit word with 8 bits red, 8 bits green, 8 bits blue and 8 bit alpha. Alpha should be 0 for all background colors.
-            // Since we are only interested in black or white we can take 32bit words at once
-            const imageData: any = ctx.getImageData(0, 0, width, height);
-            const rgbaLength: number = 4;
             const measureArrayLength: number = Math.max(Math.ceil(measure.PositionAndShape.Size.width * this.mRules.SamplingUnit), 1);
-            const tmpSkyLine: number[] = new Array(measureArrayLength);
-            const tmpBottomLine: number[] = new Array(measureArrayLength);
-            for (let x: number = 0; x < width; x++) {
-                // SkyLine
-                for (let y: number = 0; y < height; y++) {
-                    const yOffset: number = y * width * rgbaLength;
-                    const bufIndex: number = yOffset + x * rgbaLength;
-                    const alpha: number = imageData.data[bufIndex + 3];
-                    if (alpha > 0) {
-                        tmpSkyLine[x] = y;
-                        break;
+            const measureSkylineArray: number[] = new Array(measureArrayLength);
+            const measureBottomLineArray: number[] = new Array(measureArrayLength);
+            for(let idx: number = 0; idx < measureArrayLength; idx++){
+                measureSkylineArray[idx] = 0;
+                measureBottomLineArray[idx] = 4;
+            }
+            const beamQueue: Map<Note, number> = new Map();
+            for(const child of measure.PositionAndShape.ChildElements){
+                const childX: number = child.RelativePosition.x * this.mRules.SamplingUnit;
+                const x: number = Math.floor(childX - child.BorderMarginLeft);
+                const xEnd: number = Math.ceil(childX + child.BorderMarginRight);
+                if(child.BorderMarginTop < 0){
+                    for(let idx: number = x; idx < xEnd; idx++){
+                        measureSkylineArray[idx] = child.BorderMarginTop;
+                    }
+                    //Should always be the case.
+                    //TODO: This is duplicated for sky and bottom lines. Refactor better
+                    if(child.DataObject instanceof GraphicalStaffEntry){
+                        for(const gve of child.DataObject.graphicalVoiceEntries){
+                            for(const note of gve.notes){
+                                if(note instanceof VexFlowGraphicalNote){
+                                    //Note has stavenotes which contain the beam slope info
+                                    const beamNotes: Note[] = note.sourceNote?.NoteBeam?.Notes;
+                                    if(beamNotes?.length > 0){
+                                        //We have a beam.
+                                        const ourBeamIndex: number = beamNotes.indexOf(note.sourceNote);
+                                        switch(ourBeamIndex){
+                                            case 0:
+                                                beamQueue.set(note.sourceNote, x);
+                                                break;
+                                            case beamNotes.length-1:
+                                                //Find Beam Slope
+                                                for(const stavenote of note.vfnote){
+                                                    if(typeof stavenote !== "number"){
+                                                        //Only check beams on steam direction up
+                                                        const staveNoteAsAny: any = (stavenote as any);
+                                                        if(staveNoteAsAny?.stem_direction === 1){
+                                                            if(!staveNoteAsAny.beam.slope){
+                                                                staveNoteAsAny.beam.calculateSlope();
+                                                            }
+                                                            const slope: number = staveNoteAsAny.beam.slope;
+                                                            if(slope){
+                                                                let currentX: number = beamQueue.get(beamNotes[0]);
+                                                                let prevY: number = measureSkylineArray[currentX];
+                                                                //Found the end of the beam, update the skyline range
+                                                                for(currentX; currentX < xEnd; currentX++){
+                                                                    measureSkylineArray[currentX] = prevY + slope;
+                                                                    prevY = measureSkylineArray[currentX];
+                                                                }
+                                                            }
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                beamQueue.delete(beamNotes[0]);
+                                                break;
+                                            default:
+                                                break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-                // BottomLine
-                for (let y: number = height; y > 0; y--) {
-                    const yOffset: number = y * width * rgbaLength;
-                    const bufIndex: number = yOffset + x * rgbaLength;
-                    const alpha: number = imageData.data[bufIndex + 3];
-                    if (alpha > 0) {
-                        tmpBottomLine[x] = y;
-                        break;
+                if(child.BorderMarginBottom > 4){
+                    for(let idx: number = x; idx < Math.ceil(x + child.BorderMarginRight); idx++){
+                        measureBottomLineArray[idx] = child.BorderMarginBottom;
+                    }
+                    //Should always be the case.
+                    if(child.DataObject instanceof GraphicalStaffEntry){
+                        for(const gve of child.DataObject.graphicalVoiceEntries){
+                            for(const note of gve.notes){
+                                if(note instanceof VexFlowGraphicalNote){
+                                    //Note has stavenotes which contain the beam slope info
+                                    const beamNotes: Note[] = note.sourceNote?.NoteBeam?.Notes;
+                                    if(beamNotes?.length > 0){
+                                        //We have a beam.
+                                        const ourBeamIndex: number = beamNotes.indexOf(note.sourceNote);
+                                        switch(ourBeamIndex){
+                                            case 0:
+                                                beamQueue.set(note.sourceNote, x);
+                                                break;
+                                            case beamNotes.length-1:
+                                                //Find Beam Slope
+                                                for(const stavenote of note.vfnote){
+                                                    if(typeof stavenote !== "number"){
+                                                        //Only check beams on steam direction up
+                                                        const staveNoteAsAny: any = (stavenote as any);
+                                                        if(staveNoteAsAny?.stem_direction === 1){
+                                                            if(!staveNoteAsAny.beam.slope){
+                                                                staveNoteAsAny.beam.calculateSlope();
+                                                            }
+                                                            const slope: number = staveNoteAsAny.beam.slope;
+                                                            if(slope){
+                                                                let currentX: number = beamQueue.get(beamNotes[0]);
+                                                                let prevY: number = measureBottomLineArray[currentX];
+                                                                //Found the end of the beam, update the skyline range
+                                                                for(currentX; currentX < xEnd; currentX++){
+                                                                    measureBottomLineArray[currentX] = prevY + slope;
+                                                                    prevY = measureBottomLineArray[currentX];
+                                                                }
+                                                            }
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                beamQueue.delete(beamNotes[0]);
+                                                break;
+                                            default:
+                                                break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
-
-            for (let idx: number = 0; idx < tmpSkyLine.length; idx++) {
-                if (tmpSkyLine[idx] === undefined) {
-                    tmpSkyLine[idx] = Math.max(this.findPreviousValidNumber(idx, tmpSkyLine), this.findNextValidNumber(idx, tmpSkyLine));
-                }
-            }
-            for (let idx: number = 0; idx < tmpBottomLine.length; idx++) {
-                if (tmpBottomLine[idx] === undefined) {
-                    tmpBottomLine[idx] = Math.max(this.findPreviousValidNumber(idx, tmpBottomLine), this.findNextValidNumber(idx, tmpBottomLine));
-                }
-            }
-
-            this.mSkyLine.push(...tmpSkyLine);
-            this.mBottomLine.push(...tmpBottomLine);
-
-            // Set to true to only show the "mini canvases" and the corresponding skylines
-            const debugTmpCanvas: boolean = false;
-            if (debugTmpCanvas) {
-                tmpSkyLine.forEach((y, x) => this.drawPixel(new PointF2D(x, y), tmpCanvas));
-                tmpBottomLine.forEach((y, x) => this.drawPixel(new PointF2D(x, y), tmpCanvas, "blue"));
-                const img: any = canvas.toDataURL("image/png");
-                document.write('<img src="' + img + '"/>');
-            }
-            tmpCanvas.clear();
+            this.mSkyLine.push(...measureSkylineArray);
+            this.mBottomLine.push(...measureBottomLineArray);
         }
-        // Subsampling:
-        // The pixel width is bigger than the measure size in units. So we split the array into
-        // chunks with the size of MeasurePixelWidth/measureUnitWidth and reduce the value to its
-        // average
-        const arrayChunkSize: number = this.mSkyLine.length / arrayLength;
-
-        const subSampledSkyLine: number[] = [];
-        const subSampledBottomLine: number[] = [];
-        for (let chunkIndex: number = 0; chunkIndex < this.mSkyLine.length; chunkIndex += arrayChunkSize) {
-            if (subSampledSkyLine.length === arrayLength) {
-                break; // TODO find out why skyline.length becomes arrayLength + 1. see log.debug below
-            }
-
-            const endIndex: number = Math.min(this.mSkyLine.length, chunkIndex + arrayChunkSize);
-            let chunk: number[] = this.mSkyLine.slice(chunkIndex, endIndex + 1); // slice does not include end index
-            // TODO chunkIndex + arrayChunkSize is sometimes bigger than this.mSkyLine.length -> out of bounds
-            // TODO chunkIndex + arrayChunkSize is often a non-rounded float as well. is that ok to use with slice?
-            /*const diff: number = this.mSkyLine.length - (chunkIndex + arrayChunkSize);
-            if (diff < 0) { // out of bounds
-                console.log("length - slice end index: " + diff);
-            }*/
-
-            subSampledSkyLine.push(Math.min(...chunk));
-            chunk = this.mBottomLine.slice(chunkIndex, endIndex + 1); // slice does not include end index
-            subSampledBottomLine.push(Math.max(...chunk));
-        }
-
-        this.mSkyLine = subSampledSkyLine;
-        this.mBottomLine = subSampledBottomLine;
-        if (this.mSkyLine.length !== arrayLength) { // bottomline will always be same length as well
-            log.debug(`SkyLine calculation was not correct (${this.mSkyLine.length} instead of ${arrayLength})`);
-        }
-        // Remap the values from 0 to +/- height in units
-        this.mSkyLine = this.mSkyLine.map(v => (v - Math.max(...this.mSkyLine)) / unitInPixels + this.StaffLineParent.TopLineOffset);
-        this.mBottomLine = this.mBottomLine.map(v => (v - Math.min(...this.mBottomLine)) / unitInPixels + this.StaffLineParent.BottomLineOffset);
-    }
-
-    /**
-     * go backwards through the skyline array and find a number so that
-     * we can properly calculate the average
-     * @param start
-     * @param backend
-     * @param color
-     */
-    private findPreviousValidNumber(start: number, tSkyLine: number[]): number {
-        for (let idx: number = start; idx >= 0; idx--) {
-            if (!isNaN(tSkyLine[idx])) {
-                return tSkyLine[idx];
-            }
-        }
-        return 0;
-    }
-
-    /**
-     * go forward through the skyline array and find a number so that
-     * we can properly calculate the average
-     * @param start
-     * @param backend
-     * @param color
-     */
-    private findNextValidNumber(start: number, tSkyLine: Array<number>): number {
-        if (start >= tSkyLine.length) {
-            return tSkyLine[start - 1];
-        }
-        for (let idx: number = start; idx < tSkyLine.length; idx++) {
-            if (!isNaN(tSkyLine[idx])) {
-                return tSkyLine[idx];
-            }
-        }
-        return 0;
-    }
-
-    /**
-     * Debugging drawing function that can draw single pixels
-     * @param coord Point to draw to
-     * @param backend the backend to be used
-     * @param color the color to be used, default is red
-     */
-    private drawPixel(coord: PointF2D, backend: CanvasVexFlowBackend, color: string = "#FF0000FF"): void {
-        const ctx: any = backend.getContext();
-        const oldStyle: string = ctx.fillStyle;
-        ctx.fillStyle = color;
-        ctx.fillRect(coord.x, coord.y, 2, 2);
-        ctx.fillStyle = oldStyle;
     }
 
     /**
@@ -453,7 +401,9 @@ export class SkyBottomLineCalculator {
      */
     public updateWithBoundingBoxRecursively(boundingBox: BoundingBox): void {
         if (boundingBox.ChildElements && boundingBox.ChildElements.length > 0) {
-            this.updateWithBoundingBoxRecursively(boundingBox);
+            for(const child of boundingBox.ChildElements){
+                this.updateWithBoundingBoxRecursively(child);
+            }
         } else {
             const currentTopBorder: number = boundingBox.BorderTop + boundingBox.AbsolutePosition.y;
             const currentBottomBorder: number = boundingBox.BorderBottom + boundingBox.AbsolutePosition.y;
